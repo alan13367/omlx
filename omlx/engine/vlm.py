@@ -2741,6 +2741,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # Flint MoE decode: sigmoid top-k routing and the weighted combine
+        # (plus shared expert and residual) in one launch each per layer.
+        if self.model_type == "flint":
+            try:
+                from ..patches.flint_decode import apply_flint_decode_patch
+
+                apply_flint_decode_patch()
+            except Exception:
+                logger.debug("Flint decode patch not applied", exc_info=True)
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
         try:
