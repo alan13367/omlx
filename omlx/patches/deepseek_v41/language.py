@@ -834,9 +834,10 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
 
 
 def hc_mixes(x, fn, scale, base, c):
+    # One row keeps the FP32 GEMV. Multi-row MLX matmuls run at TF32 on M5.
     if (
         x.ndim == 4
-        and x.shape[1] >= 256
+        and x.shape[1] >= 2
         and x.shape[-2] == c.hc_mult == 4
         and x.shape[-1] > 0
         and x.dtype == mx.bfloat16
