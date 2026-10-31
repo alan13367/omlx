@@ -7357,7 +7357,8 @@ class TestOutputParserSmoke:
         assert outputs[-1].new_token_ids == []
         assert outputs[-1].output_token_ids == []
 
-    def test_parser_stop_sets_finish_reason(self, mock_model):
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    def test_parser_stop_sets_finish_reason(self, mock_model, ignore_eos):
         tokenizer = self._GemmaTokenizer({11: "<|return|>"})
         scheduler = Scheduler(
             model=mock_model,
@@ -7369,7 +7370,7 @@ class TestOutputParserSmoke:
         request = Request(
             request_id="parser-stop-req",
             prompt="prompt",
-            sampling_params=SamplingParams(max_tokens=5),
+            sampling_params=SamplingParams(max_tokens=5, ignore_eos=ignore_eos),
             prompt_token_ids=[1, 2, 3],
             num_prompt_tokens=3,
             status=RequestStatus.RUNNING,
@@ -7381,14 +7382,21 @@ class TestOutputParserSmoke:
         scheduler.request_id_to_uid[request.request_id] = 99
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": token, "finish_reason": None})()
+            for token in (11, 12)
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
-        assert finished_ids == {"parser-stop-req"}
-        assert outputs[-1].finished is True
-        assert outputs[-1].finish_reason == "stop"
+        if ignore_eos:
+            # The latched parser stop neither ends the row nor drops tokens.
+            assert finished_ids == set()
+            assert outputs[-1].finished is False
+            assert request.output_token_ids == [11, 12]
+        else:
+            assert finished_ids == {"parser-stop-req"}
+            assert outputs[-1].finished is True
+            assert outputs[-1].finish_reason == "stop"
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"

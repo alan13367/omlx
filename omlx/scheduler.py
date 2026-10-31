@@ -13657,8 +13657,13 @@ class Scheduler:
                 if parser_result.visible_text:
                     request.output_text += parser_result.visible_text
 
-                # Parser-defined stop token can override finish reason
-                if parser_result.is_stop and not is_finished:
+                # Parser-defined stop token can override finish reason.
+                # ignore_eos decodes through it, so count the tokens a latched
+                # parser stops recording.
+                ignore_parser_stop = (
+                    parser_result.is_stop and request.sampling_params.ignore_eos
+                )
+                if parser_result.is_stop and not is_finished and not ignore_parser_stop:
                     is_finished = True
                     is_stop = True
                     response.finish_reason = "stop"
@@ -13668,7 +13673,7 @@ class Scheduler:
                     if parser_result.record_token is not None
                     else not is_stop
                 )
-                if should_record_token:
+                if should_record_token or ignore_parser_stop:
                     request.append_output_token(response.token)
 
             elif not is_stop:
