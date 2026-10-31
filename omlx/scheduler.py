@@ -4535,7 +4535,7 @@ class Scheduler:
         reserve_tokens = _cache_base_sizes(prompt_cache) + n_tokens
         self._reserve_qsa_index_capacity(prompt_cache, reserve_tokens)
 
-        Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array)
+        Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array, prompt_cache)
 
         def _chunk_route(n_tokens: int, cache_tokens: int) -> bool:
             # Price the exact chunk execution will run: the shared
@@ -4667,22 +4667,40 @@ class Scheduler:
                         )
                 if self._supports_skip_lm_head():
                     model_kwargs["skip_lm_head"] = True
-                # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+                # Tell gather-ahead models which tokens come next. PLE starts
+                # the next chunk's rows; Engram starts its first table read,
+                # including on the final chunk so it can activate the carry.
                 prefetch = getattr(self.model, "prefetch_ple", None)
-                if prefetch is not None and embeds_array is None and remaining > n_to_process:
-                    after = processed_tokens + n_to_process
-                    next_n = _expected_chunk_len(
-                        self._prefill_step_size_for_progress(after, remaining - n_to_process),
-                        remaining - n_to_process,
-                        base_size + after,
-                        boundary_enabled,
-                        block_size,
+                engram_prefetch = getattr(self.model, "prefetch_engram", None)
+                rest = remaining - n_to_process
+                if embeds_array is None:
+                    next_n = (
+                        _expected_chunk_len(
+                            self._prefill_step_size_for_progress(
+                                processed_tokens + n_to_process, rest
+                            ),
+                            rest,
+                            base_size + processed_tokens + n_to_process,
+                            boundary_enabled,
+                            block_size,
+                        )
+                        if rest > 0
+                        else 0
                     )
-                    prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
+                    if engram_prefetch is not None:
+                        engram_prefetch(
+                            input_arr[:, n_to_process : n_to_process + next_n],
+                            input_arr[:, :n_to_process],
+                            cache=prompt_cache,
+                        )
+                    if prefetch is not None and rest > 0:
+                        prefetch(
+                            input_arr[:, n_to_process : n_to_process + next_n],
+                            input_arr[:, :n_to_process],
+                        )
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
                 if _takes_next_prefill_tokens(prefill_model):
                     # A cache-only model may skip work the next chunk replaces.
-                    rest = remaining - n_to_process
                     after = processed_tokens + n_to_process
                     model_kwargs["next_prefill_tokens"] = (
                         _expected_chunk_len(
@@ -6759,16 +6777,20 @@ class Scheduler:
         )
         return state
 
-    def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array) -> None:
-        """Let a gather-ahead model start on the first chunk before the loop reaches it (empty current chunk)."""
+    def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array, cache=None) -> None:
+        """Let gather-ahead models start on the first chunk before the loop reaches it (empty current chunk)."""
         prefetch = getattr(self.model, "prefetch_ple", None)
-        if prefetch is None or embeds_array is not None or tokens.shape[1] == 0:
+        engram_prefetch = getattr(self.model, "prefetch_engram", None)
+        if (prefetch is None and engram_prefetch is None) or embeds_array is not None or tokens.shape[1] == 0:
             return
         remaining = tokens.shape[1]
         first_n = _expected_chunk_len(
             self._prefill_step_size_for_progress(0, remaining), remaining, base_size, boundary_enabled, block_size
         )
-        prefetch(tokens[:, :first_n], tokens[:, :0])
+        if prefetch is not None:
+            prefetch(tokens[:, :first_n], tokens[:, :0])
+        if engram_prefetch is not None:
+            engram_prefetch(tokens[:, :first_n], tokens[:, :0], cache=cache)
 
     def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
         remaining = state.tokens_remaining.shape[1]
@@ -6826,7 +6848,7 @@ class Scheduler:
             # A packed row rides the head's forward, its flush and prefetch.
             if guarded:
                 Scheduler._clear_cache(self)
-                Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
+                Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None, state.cache)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
             self._reserve_qsa_index_capacity(
@@ -7066,10 +7088,20 @@ class Scheduler:
         n = plan.tokens
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
-        # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+        # Tell gather-ahead models which tokens come next; the final chunk gets
+        # an empty successor so an Engram carry can still activate.
         prefetch = getattr(self.model, "prefetch_ple", None)
-        if prefetch is not None and state.tokens_remaining.shape[1] > 0:
-            prefetch(state.tokens_remaining[:, : Scheduler._next_prefill_chunk_len(self, state, n)], chunk)
+        engram_prefetch = getattr(self.model, "prefetch_engram", None)
+        remaining = state.tokens_remaining.shape[1]
+        next_n = (
+            Scheduler._next_prefill_chunk_len(self, state, n) if remaining > 0 else 0
+        )
+        if engram_prefetch is not None:
+            engram_prefetch(
+                state.tokens_remaining[:, :next_n], chunk, cache=state.cache
+            )
+        if prefetch is not None and remaining > 0:
+            prefetch(state.tokens_remaining[:, :next_n], chunk)
         # A chunked text prefill can yield to active decode between
         # forwards. Completion cleanup or the intervening decode batch may
         # replace the VLM adapter's process-local mRoPE state. Rebind this

@@ -825,6 +825,189 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
+@pytest.mark.parametrize("dim", [32, 512, 1024, 1025, 5120])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_fused_engram_gate_is_exact(dim, dtype):
+    from omlx.patches.deepseek_v41.engram import engram_gate_reference, fused_engram_gate
+
+    rng = np.random.default_rng(41)
+    hc = 4
+    hidden = rng.normal(size=(2, 17, hc, dim)).astype(np.float32)
+    hidden[:, 0] = 0
+    projected = rng.normal(size=(11, (hc + 1) * dim)).astype(np.float32)
+    projected[0, :hc * dim] = 0
+    h, kv = mx.array(hidden, dtype), mx.array(projected, dtype)
+    inverse = (np.arange(34) % 11).reshape(2, 17)
+    q_weight = mx.array(rng.normal(size=(hc, dim)).astype(np.float32))
+    k_weight = mx.array(rng.normal(size=(hc, dim)).astype(np.float32))
+    image_mask = np.zeros((2, 17), dtype=bool)
+    image_mask[:, 3] = True
+    expected = engram_gate_reference(
+        h, kv[mx.array(inverse)], q_weight, k_weight, 1e-20, dim, hc,
+        mx.array(image_mask),
+    )
+    actual = fused_engram_gate(
+        h, kv, inverse, q_weight, k_weight, 1e-20, dim, hc,
+        mx.array(image_mask),
+    )
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual[:, 3], h[:, 3]).item()
+
+
+def test_prefill_engram_dedupe_and_fused_gate_match_reference(monkeypatch):
+    from mlx.nn import Module
+
+    from omlx.patches.deepseek_v41 import engram as engram_mod
+    from omlx.patches.deepseek_v41.storage import dedupe_tuple_ids
+
+    class RecordingWkv(Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def __call__(self, x):
+            self.seen.append(tuple(x.shape))
+            return self.inner(x)
+
+    c = tiny(
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(72,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+    )
+    model = engram_mod.Engram(c, 0)
+    load_reference_weights(model, seed=41, scale=0.05)
+    rng = np.random.default_rng(41)
+    ids = rng.integers(0, 72, (1, 32, 6), dtype=np.int32)
+    ids[0, 8:16] = ids[0, :8]
+    ids[0, 24:32] = ids[0, 16:24]
+    h = rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32)
+    mask = np.zeros((1, 32), dtype=bool)
+    mask[0, 1] = True
+
+    rows = model.embed(mx.array(ids)).flatten(-2)
+    kv = model.wkv(rows)
+    expected = engram_mod.engram_gate_reference(
+        mx.array(h),
+        kv,
+        model.q_weight,
+        model.k_weight,
+        c.norm_eps,
+        c.dim,
+        c.hc_mult,
+        mx.array(mask),
+    )
+    unique_ids, _ = dedupe_tuple_ids(ids)
+    assert unique_ids.shape[0] < 32
+
+    fused = []
+    real_fused = engram_mod.fused_engram_gate
+
+    def observe(*args, **kwargs):
+        result = real_fused(*args, **kwargs)
+        fused.append(result)
+        return result
+
+    monkeypatch.setattr(engram_mod, "fused_engram_gate", observe)
+    model.wkv = RecordingWkv(model.wkv)
+    actual = model(mx.array(h), ids, mx.array(mask))
+    mx.eval(actual, expected)
+    assert fused and fused[0] is not None
+    assert model.wkv.seen[0][0] == unique_ids.shape[0]
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        atol=2e-6,
+        rtol=1e-5,
+    )
+    np.testing.assert_array_equal(actual[:, 1], h[:, 1])
+
+
+def test_prefill_engram_dedupe_quantized_wkv_matches_reference(monkeypatch):
+    from mlx.nn import Module
+
+    from omlx.patches.deepseek_v41 import engram as engram_mod
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+    from omlx.patches.deepseek_v41.storage import dedupe_tuple_ids
+
+    class RecordingWkv(Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def __call__(self, x):
+            self.seen.append(tuple(x.shape))
+            return self.inner(x)
+
+    c = tiny(
+        dim=512,
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(97,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=8,
+        engram_head_dim=256,
+        engram_compressed_vocab_size=64,
+    )
+    model = engram_mod.Engram(c, 0)
+    rng = np.random.default_rng(19)
+    model.embed.weight = mx.array(
+        rng.normal(0, 1, model.embed.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    weight = mx.array(
+        rng.normal(0, 0.02, model.wkv.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")[:2]
+    quantized = QuantizedProjection(packed, scales, 8, "mxfp8")
+    model.wkv = quantized
+    ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
+    ids[0, 8:16] = ids[0, :8]
+    ids[0, 24:32] = ids[0, 16:24]
+    h = mx.array(
+        rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32)
+    )
+
+    rows = model.embed(mx.array(ids)).flatten(-2)
+    kv = model.wkv(rows)
+    expected = engram_mod.engram_gate_reference(
+        h,
+        kv,
+        model.q_weight,
+        model.k_weight,
+        c.norm_eps,
+        c.dim,
+        c.hc_mult,
+    )
+    unique_ids, _ = dedupe_tuple_ids(ids)
+    assert unique_ids.shape[0] < 32
+
+    fused = []
+    real_fused = engram_mod.fused_engram_gate
+
+    def observe(*args, **kwargs):
+        result = real_fused(*args, **kwargs)
+        fused.append(result)
+        return result
+
+    monkeypatch.setattr(engram_mod, "fused_engram_gate", observe)
+    model.wkv = RecordingWkv(quantized)
+    actual = model(h, ids)
+    mx.eval(actual, expected)
+    assert fused and fused[0] is not None
+    assert model.wkv.seen[0][0] == unique_ids.shape[0]
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        atol=2e-6,
+        rtol=1e-5,
+    )
+
+
 async def _run_vlm_engine(tmp_path):
     import asyncio
 

@@ -2,6 +2,7 @@
 """Token-normalized Engram lookup with request-local lookback."""
 
 import math
+from functools import cache
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,6 +10,7 @@ import numpy as np
 
 from .gemv import mxfp8_gemv_each
 from .quantization import QuantizedProjection, quantize_activation
+from .storage import dedupe_tuple_ids
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -145,6 +147,200 @@ def _project_each(p, flat):
     return mxfp8_gemv_each(quantize_activation(flat) if p.quantize_input else flat, p.weight, p.scales)
 
 
+_GATE_HEADER = r"""
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+
+inline float v41_engram_sigmoid(float g) {
+    const float neg = 1.0f / (1.0f + metal::precise::exp(abs(g)));
+    return g < 0 ? neg : 1.0f - neg;
+}
+inline float v41_engram_rsqrt_mean(float sumsq, float n, float eps) {
+    return metal::precise::rsqrt(sumsq * (1.0f / n) + eps);
+}
+"""
+
+_GATE_SOURCE = r"""
+    const uint row = threadgroup_position_in_grid.x;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint token = row / HC;
+    const uint c = row % HC;
+    const uint kv_row = uint(inv[token]);
+    const uint hrow = row * D;
+    const uint krow = kv_row * (HC + 1) * D + c * D;
+    const uint vrow = kv_row * (HC + 1) * D + HC * D;
+
+    threadgroup float part[TG / 32][3];
+    float sx = 0.0f, sk = 0.0f, dot = 0.0f;
+    // Match MLX's row reduction: adjacent reads per thread, then SIMD sums.
+    constexpr uint reads = D <= 64 ? D : 4;
+    for (uint t = 0; t < (D + TG * reads - 1) / (TG * reads); ++t) {
+        for (uint j = 0; j < reads; ++j) {
+            const uint d = tid * reads + TG * reads * t + j;
+            if (d < D) {
+                const float x = float(h[hrow + d]);
+                const float key = float(kv[krow + d]);
+                const float w = q_weight[c * D + d] * k_weight[c * D + d];
+                sx += x * x;
+                sk += key * key;
+                dot += x * w * key;
+            }
+        }
+    }
+    sx = simd_sum(sx);
+    sk = simd_sum(sk);
+    dot = simd_sum(dot);
+    if (lane == 0) {
+        part[simd][0] = sx;
+        part[simd][1] = sk;
+        part[simd][2] = dot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0) {
+        float xsum = lane < TG / 32 ? part[lane][0] : 0.0f;
+        float ksum = lane < TG / 32 ? part[lane][1] : 0.0f;
+        float dsum = lane < TG / 32 ? part[lane][2] : 0.0f;
+        xsum = simd_sum(xsum);
+        ksum = simd_sum(ksum);
+        dsum = simd_sum(dsum);
+        if (lane == 0) {
+            part[0][0] = xsum;
+            part[0][1] = ksum;
+            part[0][2] = dsum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float gatev[1];
+    if (tid == 0) {
+        const float rx = v41_engram_rsqrt_mean(part[0][0], float(D), eps[0]);
+        const float rk = v41_engram_rsqrt_mean(part[0][1], float(D), eps[0]);
+        const float scaled = part[0][2] * (rx * rk) * scalep[0];
+        float gate = 0.0f;
+        if (!(MASK && mask[token] != 0)) {
+            if (scaled == 0.0f) {
+                gate = v41_engram_sigmoid(0.001f);
+            } else {
+                const float sign = scaled > 0.0f ? 1.0f : -1.0f;
+                gate = v41_engram_sigmoid(
+                    sign * metal::precise::sqrt(max(abs(scaled), 1e-6f))
+                );
+            }
+        }
+        gatev[0] = gate;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gate = gatev[0];
+    for (uint t = 0; t < (D + TG - 1) / TG; ++t) {
+        const uint d = tid + TG * t;
+        if (d < D) {
+            out[hrow + d] = T(float(h[hrow + d]) + gate * float(kv[vrow + d]));
+        }
+    }
+"""
+
+
+@cache
+def _gate_kernel():
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_engram_gate",
+        input_names=[
+            "h", "kv", "inv", "q_weight", "k_weight", "mask", "eps", "scalep"
+        ],
+        output_names=["out"],
+        source=_GATE_SOURCE,
+        header=_GATE_HEADER,
+    )
+
+
+@cache
+def _gate_scale(dim):
+    value = mx.array([dim**-0.5], mx.float32)
+    mx.eval(value)
+    return value
+
+
+@cache
+def _gate_eps(eps):
+    value = mx.array([eps], mx.float32)
+    mx.eval(value)
+    return value
+
+
+def engram_gate_reference(h, kv, q_weight, k_weight, eps, dim, hc, image_mask=None):
+    """The official per-row gate arithmetic, used for decode and fallback."""
+    key, value = mx.split(kv, [dim * hc], axis=-1)
+    key = key.astype(mx.float32).reshape(*h.shape)
+    x = h.astype(mx.float32)
+    inv = mx.rsqrt(mx.mean(x * x, -1) + eps) * mx.rsqrt(
+        mx.mean(key * key, -1) + eps
+    )
+    weight = q_weight.astype(mx.float32) * k_weight.astype(mx.float32)
+    dot = mx.sum(x * weight * key, -1) * inv * dim**-0.5
+    gate = mx.sigmoid(mx.sign(dot) * mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)))
+    gate = mx.where(dot == 0, mx.sigmoid(mx.array(0.001)), gate)
+    if image_mask is not None:
+        gate = mx.where(image_mask[..., None], 0, gate)
+    return (x + gate[..., None] * value.astype(mx.float32)[..., None, :]).astype(
+        h.dtype
+    )
+
+
+def fused_engram_gate(
+    h, kv, inverse, q_weight, k_weight, eps, dim, hc, image_mask=None
+):
+    """Gate and value add read only the unique tuple's kv row and BF16 h.
+
+    ``kv`` is [unique tuples, (hc + 1) * dim], ``inverse`` maps every token to
+    its unique tuple. Avoids materialising key/value in FP32 and gathering the
+    full kv matrix; FP32 reductions and arithmetic match the reference.
+    """
+    if (
+        mx.default_device() != mx.gpu
+        or h.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or h.shape[-1] != dim
+        or h.shape[-2] != hc
+        or kv.shape[-1] != (hc + 1) * dim
+        or int(inverse.size) != int(h.shape[0] * h.shape[1])
+    ):
+        return None
+    if image_mask is not None and tuple(image_mask.shape) != tuple(h.shape[:-2]):
+        return None
+    mask = (
+        mx.array(image_mask, dtype=mx.uint8)
+        if image_mask is not None
+        else mx.zeros((1, 1), mx.uint8)
+    )
+    rows = h.size // dim
+    # Keep in sync with MLX 0.32.4's threadgroup_size_from_row_size.
+    threads = 32 if dim <= 512 else 128 if dim <= 1024 else min(1024, (dim + 127) // 128 * 32)
+    return _gate_kernel()(
+        inputs=[
+            h,
+            kv,
+            mx.array(inverse, dtype=mx.int32),
+            q_weight.astype(mx.float32),
+            k_weight.astype(mx.float32),
+            mask,
+            _gate_eps(eps),
+            _gate_scale(dim),
+        ],
+        template=[
+            ("T", h.dtype),
+            ("HC", hc),
+            ("D", dim),
+            ("TG", threads),
+            ("MASK", image_mask is not None),
+        ],
+        grid=(rows * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[h.shape],
+        output_dtypes=[h.dtype],
+    )[0]
+
+
 class Engram(nn.Module):
     def __init__(self, config, table_index):
         super().__init__()
@@ -164,8 +360,10 @@ class Engram(nn.Module):
 
     def __call__(self, h, ids, image_mask=None):
         c = self._config
-        rows = self.embed(mx.array(ids)).flatten(-2)
-        count = rows.shape[0] * rows.shape[1] if rows.ndim == 3 else 1
+        ids_np = np.asarray(ids, dtype=np.int64)
+        ids_host, inverse = dedupe_tuple_ids(ids_np)
+        rows = self.embed(mx.array(ids_host)).flatten(-2)
+        count = math.prod(ids_np.shape[:-1]) if ids_np.ndim >= 2 else 1
         if 1 < count <= _ROWWISE_ROWS:
             # Decode-sized inputs (one token for each of B requests, or an MTP verify block
             # of one request): project each row on its own, exactly as a single-token
@@ -179,20 +377,25 @@ class Engram(nn.Module):
             kv = kv.reshape(*rows.shape[:2], -1)
         else:
             kv = self.wkv(rows)
-        key, value = mx.split(kv, [c.dim * c.hc_mult], axis=-1)
-        key = key.astype(mx.float32).reshape(*h.shape)
-        x = h.astype(mx.float32)
-        inv = mx.rsqrt(mx.mean(x * x, -1) + c.norm_eps) * mx.rsqrt(
-            mx.mean(key * key, -1) + c.norm_eps
+        if count <= _ROWWISE_ROWS or ids_np.ndim != 3:
+            return engram_gate_reference(
+                h, kv, self.q_weight, self.k_weight, c.norm_eps, c.dim, c.hc_mult,
+                image_mask,
+            )
+        token_inverse = (
+            inverse
+            if inverse is not None
+            else np.arange(count, dtype=np.int64).reshape(ids_host.shape[:-1])
         )
-        # Reference: weight = q_weight.float() * k_weight.float(); dot = (h * weight * key).sum(-1)
-        weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)
-        dot = mx.sum(x * weight * key, -1) * inv * c.dim**-0.5
-        gate = mx.sigmoid(mx.sign(dot) * mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)))
-        # copysign(+sqrt, 0) is positive in the official reference.
-        gate = mx.where(dot == 0, mx.sigmoid(mx.array(0.001)), gate)
-        if image_mask is not None:
-            gate = mx.where(image_mask[..., None], 0, gate)
-        return (x + gate[..., None] * value.astype(mx.float32)[..., None, :]).astype(
-            h.dtype
+        fused = fused_engram_gate(
+            h, kv, token_inverse, self.q_weight, self.k_weight, c.norm_eps,
+            c.dim, c.hc_mult, image_mask,
+        )
+        if fused is not None:
+            return fused
+        if inverse is not None:
+            kv = kv[mx.array(inverse, dtype=mx.int32)]
+        return engram_gate_reference(
+            h, kv, self.q_weight, self.k_weight, c.norm_eps, c.dim, c.hc_mult,
+            image_mask,
         )
