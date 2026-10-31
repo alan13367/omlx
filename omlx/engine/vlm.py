@@ -2645,6 +2645,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
 
+        # LFM3 text tower (LFM3, -VL, -Audio, -Omni share mlx-vlm's
+        # lfm3.language): one-launch RoPE and fused decode launches.
+        if self.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
+            try:
+                from ..patches.lfm3_decode import apply_lfm3_decode_patch
+
+                apply_lfm3_decode_patch()
+            except Exception:
+                logger.debug("LFM3 decode patch not applied", exc_info=True)
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
         try:
